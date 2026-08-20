@@ -209,10 +209,7 @@ def test_service_retries_caption_client_when_default_has_no_tracks(monkeypatch):
     assert len(CaptionClientFallbackYoutubeDL.instances) == 2
     assert "extractor_args" not in CaptionClientFallbackYoutubeDL.instances[0].options
     assert CaptionClientFallbackYoutubeDL.instances[1].options["extractor_args"] == {
-        "youtube": {
-            "player_client": ["android", "ios", "web_embedded"],
-            "player_skip": ["webpage"],
-        }
+        "youtube": {"player_client": ["web_embedded"]}
     }
 
 
