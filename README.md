@@ -1,6 +1,6 @@
-# Caption Field Notes
+# YTVID Transcript Extractor
 
-Caption Field Notes is a local-friendly and Vercel-deployable YouTube transcript extractor. It discovers recent normal videos from a channel, retrieves captions through the official `yt-dlp` Python API, removes deterministic rolling-caption repetition, and returns readable timestamped plain text.
+YTVID Transcript Extractor is a local-friendly and Vercel-deployable YouTube transcript extractor. It discovers recent normal videos from a channel, retrieves captions through the official `yt-dlp` Python API, removes deterministic rolling-caption repetition, and returns readable timestamped plain text.
 
 The application never downloads video or audio. Subtitle payloads are processed in memory inside the individual request that asked for them.
 
@@ -31,7 +31,7 @@ FastAPI application
 
 The browser orchestrates batches with two concurrent `POST /api/transcript` requests. There is no server-side job queue, database, persistent runtime directory, background worker, or server-side ZIP file.
 
-The FastAPI app is exposed to Vercel through the thin `api/index.py` entrypoint, which imports the real application from `backend/app.py`. After `pnpm build`, FastAPI serves the Vite `dist/` directory with `app.frontend()` when available and falls back to Starlette `StaticFiles` under plain Uvicorn.
+Vercel is explicitly configured with the `Other` framework preset so it keeps both deployment products: `dist/` is the Vite static output and `api/index.py` is the native Python function entrypoint. The entrypoint imports the real FastAPI application from `backend/app.py`; plain Uvicorn still serves the same application locally.
 
 ## Requirements
 
@@ -148,7 +148,7 @@ Successful responses include the video metadata, caption source, selected langua
 6. Verify `https://<project>.vercel.app/api/health`.
 7. Test one public individual video before testing a small channel batch.
 
-`pyproject.toml` points Vercel at `api.index:app` and runs `pnpm build` before deployment. `api/index.py` imports the modular FastAPI application from `backend/app.py`; `vercel.json` configures that actual function entrypoint with a 180-second maximum duration. No legacy `builds` or `routes` configuration is used.
+`vercel.json` selects the `Other` preset, runs `pnpm build`, serves `dist/`, and configures the actual `api/index.py` Python function with a 180-second maximum duration. `api/index.py` imports the modular FastAPI application from `backend/app.py`; no legacy `builds` or `routes` configuration is used.
 
 Vercel's Git integration creates Preview Deployments for branch and pull-request pushes. Merging the configured production branch, normally `main`, creates a Production Deployment. Future pushes to that branch deploy automatically.
 

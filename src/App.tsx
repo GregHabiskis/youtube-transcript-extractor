@@ -11,6 +11,7 @@ import {
   ExternalLink,
   Eye,
   FileText,
+  Github,
   LoaderCircle,
   ListVideo,
   Minus,
@@ -194,31 +195,46 @@ function App() {
       text: item.result?.transcript ?? "",
     }));
     if (entries.length === 0) return;
-    downloadBytes("caption-field-notes.zip", makeZip(entries));
+    downloadBytes("ytvid-transcripts.zip", makeZip(entries));
   }
 
   return (
     <main className="min-h-screen overflow-hidden bg-[var(--paper)] text-[var(--ink)]">
-      <div className="mx-auto max-w-7xl px-5 pb-20 pt-5 sm:px-8 lg:px-12">
-        <header className="flex items-center justify-between border-b border-[var(--line)] pb-5">
-          <a href="/" className="flex items-center gap-3" aria-label="Caption Field Notes home">
+      <div className="mx-auto flex min-h-screen max-w-7xl flex-col px-5 pb-20 pt-5 sm:px-8 lg:px-12">
+        <header className="flex flex-wrap items-center justify-between gap-4 border-b border-[var(--line)] pb-5">
+          <a href="/" className="flex min-w-0 items-center gap-3" aria-label="YTVID Transcript Extractor home">
             <span className="grid h-9 w-9 place-items-center rounded-xl bg-[var(--ink)] text-[var(--paper)]">
               <Youtube size={18} strokeWidth={2.5} />
             </span>
-            <span className="font-mono text-[11px] font-bold uppercase tracking-[0.22em]">Caption Field Notes</span>
+            <span className="truncate font-mono text-[11px] font-bold uppercase tracking-[0.16em] sm:tracking-[0.22em]">YTVID Transcript Extractor</span>
           </a>
-          <span className="hidden font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--muted)] sm:block">
-            Local utility / yt-dlp
-          </span>
+          <div className="flex shrink-0 items-center gap-3">
+            <span className="hidden font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--muted)] sm:block">
+              Local utility / yt-dlp
+            </span>
+            <Button asChild variant="outline" size="sm" className="shrink-0">
+              <a
+                href="https://github.com/GregHabiskis/youtube-transcript-extractor"
+                target="_blank"
+                rel="noopener noreferrer"
+                aria-label="View project on GitHub"
+                title="View project on GitHub"
+              >
+                <Github size={15} aria-hidden="true" />
+                GitHub
+              </a>
+            </Button>
+          </div>
         </header>
 
-        <section className="grid gap-10 pb-12 pt-12 lg:grid-cols-[1.05fr_0.95fr] lg:items-end lg:pt-20">
+        <div className="flex-1">
+          <section className="grid gap-10 pb-12 pt-12 lg:grid-cols-[1.05fr_0.95fr] lg:items-end lg:pt-20">
           <div>
             <Badge className="border-[var(--accent)]/30 bg-[var(--accent)]/8 text-[var(--accent-dark)]">
               <Sparkles size={12} className="mr-1.5" /> Clean transcripts, kept local
             </Badge>
             <h1 className="mt-6 max-w-3xl font-display text-5xl font-semibold leading-[0.96] tracking-[-0.06em] sm:text-7xl">
-              Turn a channel feed into readable field notes.
+              Turn a channel feed into clean transcripts.
             </h1>
             <p className="mt-6 max-w-xl text-base leading-7 text-[var(--muted)] sm:text-lg">
               Inspect the latest uploads, keep the ones you expect, and extract timestamped captions without downloading video or audio.
@@ -393,6 +409,10 @@ function App() {
             )}
           </section>
         )}
+        </div>
+        <footer className="mt-16 border-t border-[var(--line)] pt-6 text-center text-sm text-[var(--muted)]">
+          Made by Greg Habiskis
+        </footer>
       </div>
     </main>
   );

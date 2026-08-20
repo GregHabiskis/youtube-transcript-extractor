@@ -18,7 +18,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 DIST_DIR = ROOT_DIR / "dist"
 
 app = FastAPI(
-    title="Caption Field Notes API",
+    title="YTVID Transcript Extractor API",
     version="0.1.0",
     docs_url="/api/docs",
     redoc_url=None,
