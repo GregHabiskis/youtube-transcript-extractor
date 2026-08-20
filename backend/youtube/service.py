@@ -333,21 +333,28 @@ class YouTubeService:
     def _extract_caption_client_fallback(self, url: str) -> Mapping[str, Any] | None:
         options = self._transcript_options()
         options["extractor_args"] = {
-            "youtube": {"player_client": ["ios"], "player_skip": ["webpage"]}
+            "youtube": {
+                "player_client": ["android", "ios", "web_embedded"],
+                "player_skip": ["webpage"],
+            }
         }
-        logger.debug("yt_dlp_stage=caption_client_fallback_start client=ios")
+        logger.debug(
+            "yt_dlp_stage=caption_client_fallback_start clients=android,ios,web_embedded "
+            "skip=webpage"
+        )
         try:
             info = self._extract_info(url, options)
         except Exception as exc:
             logger.warning(
-                "yt_dlp_stage=caption_client_fallback_failed client=ios "
+                "yt_dlp_stage=caption_client_fallback_failed clients=android,ios,web_embedded "
                 "exception_type=%s message=%s",
                 type(exc).__name__,
                 _safe_error_message(exc),
             )
             return None
         logger.debug(
-            "yt_dlp_stage=caption_client_fallback_ok client=ios manual=%d automatic=%d",
+            "yt_dlp_stage=caption_client_fallback_ok clients=android,ios,web_embedded "
+            "manual=%d automatic=%d",
             len(_language_keys(info.get("subtitles"))),
             len(_language_keys(info.get("automatic_captions"))),
         )
