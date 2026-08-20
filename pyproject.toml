@@ -36,7 +36,7 @@ target-version = "py314"
 select = ["E", "F", "I", "UP", "B"]
 
 [tool.vercel]
-entrypoint = "backend.app:app"
+entrypoint = "api.index:app"
 
 [tool.vercel.scripts]
-build = "npm run build"
+build = "pnpm build"

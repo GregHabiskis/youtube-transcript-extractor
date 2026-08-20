@@ -31,7 +31,7 @@ FastAPI application
 
 The browser orchestrates batches with two concurrent `POST /api/transcript` requests. There is no server-side job queue, database, persistent runtime directory, background worker, or server-side ZIP file.
 
-The FastAPI app is exposed to Vercel through the current `tool.vercel.entrypoint` setting in `pyproject.toml`. After `npm run build`, FastAPI serves the Vite `dist/` directory with `app.frontend()` when available and falls back to Starlette `StaticFiles` under plain Uvicorn.
+The FastAPI app is exposed to Vercel through the thin `api/index.py` entrypoint, which imports the real application from `backend/app.py`. After `pnpm build`, FastAPI serves the Vite `dist/` directory with `app.frontend()` when available and falls back to Starlette `StaticFiles` under plain Uvicorn.
 
 ## Requirements
 
@@ -62,7 +62,7 @@ python -m pip install -e ".[dev]"
 Install the frontend dependencies:
 
 ```bash
-npm install
+pnpm install
 ```
 
 ## Local Development
@@ -78,7 +78,7 @@ uv run uvicorn backend.app:app --host 127.0.0.1 --port 8000
 Terminal 2:
 
 ```bash
-npm run dev
+pnpm dev
 ```
 
 Open `http://127.0.0.1:5173`. Vite proxies relative `/api/*` requests to `http://127.0.0.1:8000`.
@@ -86,13 +86,13 @@ Open `http://127.0.0.1:5173`. Vite proxies relative `/api/*` requests to `http:/
 For a production-like local check where FastAPI serves the compiled React application:
 
 ```bash
-npm run build
+pnpm build
 uv run uvicorn backend.app:app --host 127.0.0.1 --port 8000
 ```
 
 Open `http://127.0.0.1:8000`.
 
-If the Vercel CLI is installed, `vercel dev` can also run the project using Vercel's local runtime emulation.
+If the Vercel CLI is needed for local runtime emulation, run `pnpm dlx vercel@latest dev`.
 
 ## Usage
 
@@ -148,7 +148,7 @@ Successful responses include the video metadata, caption source, selected langua
 6. Verify `https://<project>.vercel.app/api/health`.
 7. Test one public individual video before testing a small channel batch.
 
-`pyproject.toml` points Vercel at `backend.app:app` and runs `npm run build` before deployment. `vercel.json` configures the FastAPI function with a 180-second maximum duration. No legacy `builds` or `routes` configuration is used.
+`pyproject.toml` points Vercel at `api.index:app` and runs `pnpm build` before deployment. `api/index.py` imports the modular FastAPI application from `backend/app.py`; `vercel.json` configures that actual function entrypoint with a 180-second maximum duration. No legacy `builds` or `routes` configuration is used.
 
 Vercel's Git integration creates Preview Deployments for branch and pull-request pushes. Merging the configured production branch, normally `main`, creates a Production Deployment. Future pushes to that branch deploy automatically.
 
@@ -183,13 +183,13 @@ uv run pytest
 Run frontend tests:
 
 ```bash
-npm run test
+pnpm test
 ```
 
 Build the production frontend:
 
 ```bash
-npm run build
+pnpm build
 ```
 
 Run lint checks when the development extra is installed:
@@ -198,4 +198,4 @@ Run lint checks when the development extra is installed:
 uv run ruff check backend tests
 ```
 
-If the Vercel CLI is available, validate the deployment bundle with `vercel build`. An authenticated production deployment is not required for local development or the normal test suite.
+Validate the deployment bundle with `pnpm dlx vercel@latest build` when the Vercel CLI is not installed locally. An authenticated production deployment is not required for local development or the normal test suite.
