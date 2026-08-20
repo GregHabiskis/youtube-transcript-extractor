@@ -316,6 +316,11 @@ def test_service_reports_true_no_caption_case(monkeypatch):
             return []
 
     monkeypatch.setattr("backend.youtube.service.YoutubeDL", NoCaptionYoutubeDL)
+    monkeypatch.setattr(
+        YouTubeService,
+        "_extract_innertube_fallback",
+        staticmethod(lambda *_args: None),
+    )
     monkeypatch.setattr("backend.youtube.service.YouTubeTranscriptApi", EmptyTranscriptApi)
     result = YouTubeService().extract_transcript("https://youtu.be/BaW_jenozKc", "en")
     assert result.status == "no_captions"
@@ -351,6 +356,11 @@ def test_service_uses_transcript_api_when_yt_dlp_has_no_tracks(monkeypatch):
             return [FakeTranscript()]
 
     monkeypatch.setattr("backend.youtube.service.YoutubeDL", NoTrackYoutubeDL)
+    monkeypatch.setattr(
+        YouTubeService,
+        "_extract_innertube_fallback",
+        staticmethod(lambda *_args: None),
+    )
     monkeypatch.setattr("backend.youtube.service.YouTubeTranscriptApi", FallbackTranscriptApi)
     result = YouTubeService().extract_transcript("https://youtu.be/BaW_jenozKc", "en")
 
@@ -359,6 +369,72 @@ def test_service_uses_transcript_api_when_yt_dlp_has_no_tracks(monkeypatch):
     assert result.language == "en"
     assert result.format is None
     assert "fallback words" in result.transcript
+
+
+def test_service_uses_innertube_when_caption_clients_have_no_tracks(monkeypatch):
+    class NoTrackYoutubeDL(FakeYoutubeDL):
+        def extract_info(self, url, download=False):
+            self.info_calls.append((url, download))
+            return {
+                "id": "BaW_jenozKc",
+                "title": "InnerTube fallback",
+                "channel": "Example Channel",
+            }
+
+    class FakeResponse:
+        def __init__(self, payload=None, content=b""):
+            self.payload = payload
+            self.content = content
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    caption_data = json.dumps(
+        {
+            "events": [
+                {
+                    "tStartMs": 0,
+                    "dDurationMs": 1000,
+                    "segs": [{"utf8": "InnerTube words"}],
+                }
+            ]
+        }
+    ).encode()
+
+    def fake_post(url, **_kwargs):
+        assert url == "https://www.youtube.com/youtubei/v1/player"
+        return FakeResponse(
+            payload={
+                "captions": {
+                    "playerCaptionsTracklistRenderer": {
+                        "captionTracks": [
+                            {
+                                "languageCode": "en",
+                                "baseUrl": "https://www.youtube.com/api/timedtext?v=BaW_jenozKc",
+                            }
+                        ]
+                    }
+                }
+            }
+        )
+
+    def fake_get(url, **_kwargs):
+        assert "fmt=json3" in url
+        return FakeResponse(content=caption_data)
+
+    monkeypatch.setattr("backend.youtube.service.YoutubeDL", NoTrackYoutubeDL)
+    monkeypatch.setattr("backend.youtube.service.requests.post", fake_post)
+    monkeypatch.setattr("backend.youtube.service.requests.get", fake_get)
+    result = YouTubeService().extract_transcript("https://youtu.be/BaW_jenozKc", "en")
+
+    assert result.status == "complete"
+    assert result.source == "manual"
+    assert result.language == "en"
+    assert result.format == "json3"
+    assert "InnerTube words" in result.transcript
 
 
 def test_service_distinguishes_missing_requested_language(monkeypatch):

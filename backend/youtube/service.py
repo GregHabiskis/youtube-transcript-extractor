@@ -6,8 +6,9 @@ import re
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+import requests
 from youtube_transcript_api import YouTubeTranscriptApi
 from yt_dlp import YoutubeDL
 from yt_dlp.networking import Request
@@ -233,6 +234,10 @@ class YouTubeService:
                         manual_languages = fallback_manual_languages
                         automatic_languages = fallback_automatic_languages
         if not manual_languages and not automatic_languages:
+            innertube_result = self._extract_innertube_fallback(video, language)
+            if innertube_result is not None:
+                return innertube_result
+        if not manual_languages and not automatic_languages:
             transcript_api_result = self._extract_transcript_api_fallback(video, language)
             if transcript_api_result is not None:
                 return transcript_api_result
@@ -359,6 +364,97 @@ class YouTubeService:
             len(_language_keys(info.get("automatic_captions"))),
         )
         return info
+
+    @staticmethod
+    def _extract_innertube_fallback(
+        video: VideoMetadata, requested_language: str
+    ) -> TranscriptOutput | None:
+        logger.debug(
+            "yt_dlp_stage=innertube_fallback_start video_id=%s requested_language=%s",
+            video.id,
+            requested_language,
+        )
+        try:
+            response = requests.post(
+                "https://www.youtube.com/youtubei/v1/player",
+                headers={"Accept-Language": "en-US", "Content-Type": "application/json"},
+                json={
+                    "context": {
+                        "client": {"clientName": "ANDROID", "clientVersion": "20.10.38"}
+                    },
+                    "videoId": video.id,
+                },
+                timeout=20,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            tracks = (
+                payload.get("captions", {})
+                .get("playerCaptionsTracklistRenderer", {})
+                .get("captionTracks", [])
+            )
+            if not isinstance(tracks, Sequence) or isinstance(tracks, (str, bytes)):
+                return None
+            selected = _select_innertube_track(tracks, requested_language)
+            if selected is None:
+                logger.debug(
+                    "yt_dlp_stage=innertube_fallback_no_track video_id=%s available=%d",
+                    video.id,
+                    len(tracks),
+                )
+                return None
+            caption_url = _json3_caption_url(selected.get("baseUrl"))
+            if caption_url is None:
+                return None
+            caption_response = requests.get(caption_url, timeout=20)
+            caption_response.raise_for_status()
+            if len(caption_response.content) > MAX_SUBTITLE_BYTES:
+                return None
+            raw_data = caption_response.content.decode("utf-8-sig", errors="replace")
+            try:
+                cues = parse_json3(raw_data)
+            except SubtitleParseError:
+                cues = parse_vtt(raw_data)
+            cleaned = clean_cues(cues)
+            blocks = merge_paragraphs(cleaned)
+            if not blocks:
+                return None
+            source = "automatic" if str(selected.get("kind", "")).casefold() == "asr" else "manual"
+            language = str(selected.get("languageCode", ""))
+            transcript = render_plaintext(
+                title=video.title,
+                channel=video.channel,
+                url=video.url,
+                upload_date=video.upload_date,
+                source=source,
+                language=language,
+                blocks=blocks,
+            )
+            logger.debug(
+                "yt_dlp_stage=innertube_fallback_ok video_id=%s source=%s language=%s "
+                "cues=%d blocks=%d",
+                video.id,
+                source,
+                language,
+                len(cues),
+                len(blocks),
+            )
+            return TranscriptOutput(
+                video=video,
+                source=source,
+                language=language,
+                blocks=blocks,
+                transcript=transcript,
+                format="json3",
+            )
+        except Exception as exc:
+            logger.warning(
+                "yt_dlp_stage=innertube_fallback_failed video_id=%s exception_type=%s message=%s",
+                video.id,
+                type(exc).__name__,
+                _safe_error_message(exc),
+            )
+            return None
 
     @staticmethod
     def _extract_transcript_api_fallback(
@@ -719,6 +815,48 @@ def _select_transcript_api_track(
         if ranked:
             return ranked[0]
     return None
+
+
+def _select_innertube_track(
+    tracks: Sequence[Any], requested_language: str
+) -> Mapping[str, Any] | None:
+    requested = requested_language.casefold().replace("_", "-")
+    for is_generated in (False, True):
+        candidates = [
+            track
+            for track in tracks
+            if isinstance(track, Mapping)
+            and (str(track.get("kind", "")).casefold() == "asr") is is_generated
+        ]
+        ranked = sorted(
+            candidates,
+            key=lambda track: (
+                _language_score(track.get("languageCode", ""), requested),
+                str(track.get("languageCode", "")),
+            ),
+        )
+        if requested != "auto":
+            ranked = [
+                track
+                for track in ranked
+                if _language_score(track.get("languageCode", ""), requested) < 100
+            ]
+        if ranked:
+            return ranked[0]
+    return None
+
+
+def _json3_caption_url(value: Any) -> str | None:
+    if not isinstance(value, str) or not _is_allowed_caption_url(value):
+        return None
+    parts = urlsplit(value)
+    query = [
+        (key, item)
+        for key, item in parse_qsl(parts.query, keep_blank_values=True)
+        if key != "fmt"
+    ]
+    query.append(("fmt", "json3"))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
 def _transcript_api_cues(snippets: Sequence[Any]) -> list[TranscriptCue]:
