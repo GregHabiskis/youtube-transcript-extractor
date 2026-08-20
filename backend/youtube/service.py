@@ -332,7 +332,9 @@ class YouTubeService:
 
     def _extract_caption_client_fallback(self, url: str) -> Mapping[str, Any] | None:
         options = self._transcript_options()
-        options["extractor_args"] = {"youtube": {"player_client": ["ios"]}}
+        options["extractor_args"] = {
+            "youtube": {"player_client": ["ios"], "player_skip": ["webpage"]}
+        }
         logger.debug("yt_dlp_stage=caption_client_fallback_start client=ios")
         try:
             info = self._extract_info(url, options)
