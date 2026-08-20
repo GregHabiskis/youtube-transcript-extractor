@@ -67,21 +67,13 @@ pnpm install
 
 ## Local Development
 
-For Vite hot reload and a separate FastAPI development process, use two terminals.
-
-Terminal 1:
-
-```bash
-uv run uvicorn backend.app:app --host 127.0.0.1 --port 8000
-```
-
-For detailed local yt-dlp/caption pipeline diagnostics, set `YTVID_LOG_LEVEL=DEBUG` before starting FastAPI.
-
-Terminal 2:
+Start both the FastAPI backend and Vite frontend with one command:
 
 ```bash
 pnpm dev
 ```
+
+For detailed local yt-dlp/caption pipeline diagnostics, run `YTVID_LOG_LEVEL=DEBUG pnpm dev`.
 
 Open `http://127.0.0.1:5173`. Vite proxies relative `/api/*` requests to `http://127.0.0.1:8000`.
 
