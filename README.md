@@ -33,6 +33,41 @@ The browser orchestrates batches with two concurrent `POST /api/transcript` requ
 
 Vercel is explicitly configured with its `FastAPI` framework preset so all requests are routed through one Python application. The `api/index.py` entrypoint imports the real FastAPI application from `backend/app.py`; after `pnpm build`, FastAPI serves the Vite `dist/` directory through its frontend integration, while plain Uvicorn serves the same application locally.
 
+## Tech Stack
+
+### Shared Stack
+
+- Frontend: React 19 with TypeScript.
+- Bundler and development server: Vite 7.
+- Styling: Tailwind CSS 4.
+- UI utilities: Radix Slot, Lucide React, `clsx`, `tailwind-merge`, and `fflate`.
+- Backend: Python 3.14 with FastAPI and Uvicorn.
+- YouTube extraction: the official `yt-dlp` Python API.
+- Package managers: `pnpm@11.15.0` for JavaScript and `uv` for Python.
+- Storage: none. Caption data is processed in memory per request.
+- Database, authentication, and persistent application storage: none.
+- Media processing: no video or audio downloads; captions only.
+
+### Localhost
+
+- `pnpm dev` starts the Vite frontend at `http://127.0.0.1:5173` and the Uvicorn backend at `http://127.0.0.1:8000`.
+- Vite proxies relative `/api/*` requests to FastAPI.
+- The frontend source is in `src/` and the backend source is in `backend/`.
+- Browser-side ZIP exports use `fflate`.
+- Python development tools include pytest, Ruff, and HTTPX.
+
+### Vercel
+
+- Hosting: Vercel Python Serverless Functions.
+- Framework preset: `FastAPI`.
+- Entrypoint: `api/index.py`, which imports `backend.app:app`.
+- Build command: `pnpm build`, which runs `tsc -b && vite build` and writes the frontend to `dist/`.
+- FastAPI serves the compiled React frontend and `/api/*` routes from the same deployment.
+- Function maximum duration: 180 seconds.
+- `yt-dlp` uses Node/EJS challenge support when a supported JavaScript runtime is available.
+- `YTDLP_PROXY_URL` is optional and is used only for a single retry after detected YouTube blocking.
+- The Vercel runtime is stateless: there is no database, queue, persistent filesystem, or background worker.
+
 ## Requirements
 
 - Python 3.14.x
