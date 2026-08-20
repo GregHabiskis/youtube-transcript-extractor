@@ -31,7 +31,7 @@ FastAPI application
 
 The browser orchestrates batches with two concurrent `POST /api/transcript` requests. There is no server-side job queue, database, persistent runtime directory, background worker, or server-side ZIP file.
 
-Vercel is explicitly configured with the `Other` framework preset so it keeps both deployment products: `dist/` is the Vite static output and `api/index.py` is the native Python function entrypoint. The entrypoint imports the real FastAPI application from `backend/app.py`; plain Uvicorn still serves the same application locally.
+Vercel is explicitly configured with its `FastAPI` framework preset so all requests are routed through one Python application. The `api/index.py` entrypoint imports the real FastAPI application from `backend/app.py`; after `pnpm build`, FastAPI serves the Vite `dist/` directory through its frontend integration, while plain Uvicorn serves the same application locally.
 
 ## Requirements
 
@@ -148,7 +148,7 @@ Successful responses include the video metadata, caption source, selected langua
 6. Verify `https://<project>.vercel.app/api/health`.
 7. Test one public individual video before testing a small channel batch.
 
-`vercel.json` selects the `Other` preset, runs `pnpm build`, serves `dist/`, and configures the actual `api/index.py` Python function with a 180-second maximum duration. `api/index.py` imports the modular FastAPI application from `backend/app.py`; no legacy `builds` or `routes` configuration is used.
+`vercel.json` selects the `FastAPI` preset and configures the resolved `api/index.py` function with a 180-second maximum duration. `pyproject.toml` points Vercel at `api.index:app` and runs `pnpm build`; FastAPI owns `/` and `/api/*`, so the browser and backend use the same complete paths. No legacy `builds` or `routes` configuration is used.
 
 Vercel's Git integration creates Preview Deployments for branch and pull-request pushes. Merging the configured production branch, normally `main`, creates a Production Deployment. Future pushes to that branch deploy automatically.
 

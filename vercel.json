@@ -1,8 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "framework": null,
-  "buildCommand": "pnpm build",
-  "outputDirectory": "dist",
+  "framework": "fastapi",
   "functions": {
     "api/index.py": {
       "maxDuration": 180
