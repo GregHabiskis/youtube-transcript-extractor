@@ -599,6 +599,8 @@ class YouTubeService:
             "extractor_retries": 2,
             "fragment_retries": 2,
             "check_formats": False,
+            "js_runtimes": {"node": {}},
+            "remote_components": {"ejs:github"},
             "logger": _YtDlpLogger(),
         }
 
