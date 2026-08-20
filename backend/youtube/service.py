@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from typing import Any
 from urllib.parse import urlsplit
 
+from youtube_transcript_api import YouTubeTranscriptApi
 from yt_dlp import YoutubeDL
 from yt_dlp.networking import Request
 from yt_dlp.utils import DownloadError, ExtractorError
 
 from backend.transcripts.cleaner import clean_cues, merge_paragraphs
 from backend.transcripts.json3 import SubtitleParseError, parse_json3
-from backend.transcripts.models import TranscriptBlock
+from backend.transcripts.models import TranscriptBlock, TranscriptCue
 from backend.transcripts.renderer import render_plaintext
 from backend.transcripts.vtt import parse_vtt
 
@@ -230,6 +232,10 @@ class YouTubeService:
                         video = fallback_video
                         manual_languages = fallback_manual_languages
                         automatic_languages = fallback_automatic_languages
+        if not manual_languages and not automatic_languages:
+            transcript_api_result = self._extract_transcript_api_fallback(video, language)
+            if transcript_api_result is not None:
+                return transcript_api_result
         logger.debug(
             "yt_dlp_stage=caption_discovery video_id=%s manual_languages=%s "
             "automatic_language_count=%d automatic_sample=%s",
@@ -344,6 +350,68 @@ class YouTubeService:
             len(_language_keys(info.get("automatic_captions"))),
         )
         return info
+
+    @staticmethod
+    def _extract_transcript_api_fallback(
+        video: VideoMetadata, requested_language: str
+    ) -> TranscriptOutput | None:
+        logger.debug(
+            "yt_dlp_stage=transcript_api_fallback_start video_id=%s requested_language=%s",
+            video.id,
+            requested_language,
+        )
+        try:
+            transcript_list = list(YouTubeTranscriptApi().list(video.id))
+            selected = _select_transcript_api_track(transcript_list, requested_language)
+            if selected is None:
+                logger.debug(
+                    "yt_dlp_stage=transcript_api_fallback_no_track video_id=%s available=%d",
+                    video.id,
+                    len(transcript_list),
+                )
+                return None
+            snippets = selected.fetch()
+            cues = _transcript_api_cues(snippets)
+            cleaned = clean_cues(cues)
+            blocks = merge_paragraphs(cleaned)
+            if not blocks:
+                return None
+            source = "automatic" if bool(selected.is_generated) else "manual"
+            language = str(selected.language_code)
+            transcript = render_plaintext(
+                title=video.title,
+                channel=video.channel,
+                url=video.url,
+                upload_date=video.upload_date,
+                source=source,
+                language=language,
+                blocks=blocks,
+            )
+            logger.debug(
+                "yt_dlp_stage=transcript_api_fallback_ok video_id=%s source=%s "
+                "language=%s cues=%d blocks=%d",
+                video.id,
+                source,
+                language,
+                len(cues),
+                len(blocks),
+            )
+            return TranscriptOutput(
+                video=video,
+                source=source,
+                language=language,
+                blocks=blocks,
+                transcript=transcript,
+            )
+        except Exception as exc:
+            logger.warning(
+                "yt_dlp_stage=transcript_api_fallback_failed video_id=%s "
+                "exception_type=%s message=%s",
+                video.id,
+                type(exc).__name__,
+                _safe_error_message(exc),
+            )
+            return None
 
     def _extract_info(
         self, url: str, extra_options: Mapping[str, Any] | None = None
@@ -614,6 +682,55 @@ def _select_track(
             if track:
                 return source, str(language), track
     return None, None, None
+
+
+def _select_transcript_api_track(
+    transcripts: Sequence[Any], requested_language: str
+) -> Any | None:
+    requested = requested_language.casefold().replace("_", "-")
+    for is_generated in (False, True):
+        candidates = [
+            transcript
+            for transcript in transcripts
+            if bool(getattr(transcript, "is_generated", False)) is is_generated
+        ]
+        ranked = sorted(
+            candidates,
+            key=lambda transcript: (
+                _language_score(getattr(transcript, "language_code", ""), requested),
+                str(getattr(transcript, "language_code", "")),
+            ),
+        )
+        if requested != "auto":
+            ranked = [
+                transcript
+                for transcript in ranked
+                if _language_score(getattr(transcript, "language_code", ""), requested) < 100
+            ]
+        if ranked:
+            return ranked[0]
+    return None
+
+
+def _transcript_api_cues(snippets: Sequence[Any]) -> list[TranscriptCue]:
+    cues: list[TranscriptCue] = []
+    for snippet in snippets:
+        if isinstance(snippet, Mapping):
+            text = _string_value(snippet.get("text"))
+            start_seconds = _number_value(snippet.get("start"))
+            duration_seconds = _number_value(snippet.get("duration"))
+        else:
+            text = _string_value(getattr(snippet, "text", None))
+            start_seconds = _number_value(getattr(snippet, "start", None))
+            duration_seconds = _number_value(getattr(snippet, "duration", None))
+        if not text or start_seconds is None or duration_seconds is None:
+            continue
+        if not math.isfinite(start_seconds) or not math.isfinite(duration_seconds):
+            continue
+        start_ms = max(0, round(start_seconds * 1000))
+        end_ms = max(start_ms + 1, round((start_seconds + max(0, duration_seconds)) * 1000))
+        cues.append(TranscriptCue(start_ms=start_ms, end_ms=end_ms, text=text))
+    return cues
 
 
 def _language_keys(value: Any) -> list[str]:

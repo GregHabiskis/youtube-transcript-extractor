@@ -308,10 +308,54 @@ def test_service_reports_true_no_caption_case(monkeypatch):
             self.info_calls.append((url, download))
             return {"id": "BaW_jenozKc", "title": "No captions"}
 
+    class EmptyTranscriptApi:
+        def list(self, _video_id):
+            return []
+
     monkeypatch.setattr("backend.youtube.service.YoutubeDL", NoCaptionYoutubeDL)
+    monkeypatch.setattr("backend.youtube.service.YouTubeTranscriptApi", EmptyTranscriptApi)
     result = YouTubeService().extract_transcript("https://youtu.be/BaW_jenozKc", "en")
     assert result.status == "no_captions"
     assert result.code == "NO_CAPTIONS"
+
+
+def test_service_uses_transcript_api_when_yt_dlp_has_no_tracks(monkeypatch):
+    class NoTrackYoutubeDL(FakeYoutubeDL):
+        def extract_info(self, url, download=False):
+            self.info_calls.append((url, download))
+            return {
+                "id": "BaW_jenozKc",
+                "title": "Transcript API fallback",
+                "channel": "Example Channel",
+            }
+
+    class FakeTranscript:
+        language_code = "en"
+        is_generated = False
+
+        def fetch(self):
+            return [
+                type(
+                    "Snippet",
+                    (),
+                    {"text": "fallback words", "start": 0.0, "duration": 1.0},
+                )()
+            ]
+
+    class FallbackTranscriptApi:
+        def list(self, video_id):
+            assert video_id == "BaW_jenozKc"
+            return [FakeTranscript()]
+
+    monkeypatch.setattr("backend.youtube.service.YoutubeDL", NoTrackYoutubeDL)
+    monkeypatch.setattr("backend.youtube.service.YouTubeTranscriptApi", FallbackTranscriptApi)
+    result = YouTubeService().extract_transcript("https://youtu.be/BaW_jenozKc", "en")
+
+    assert result.status == "complete"
+    assert result.source == "manual"
+    assert result.language == "en"
+    assert result.format is None
+    assert "fallback words" in result.transcript
 
 
 def test_service_distinguishes_missing_requested_language(monkeypatch):
