@@ -380,6 +380,9 @@ class YouTubeService:
             request_headers = {
                 "Accept-Language": "en-US",
                 "Content-Type": "application/json",
+                "User-Agent": "com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip",
+                "X-YouTube-Client-Name": "3",
+                "X-YouTube-Client-Version": "20.10.38",
             }
             tracks: Any = []
             last_error: Exception | None = None
@@ -433,7 +436,16 @@ class YouTubeService:
             caption_url = _json3_caption_url(selected.get("baseUrl"))
             if caption_url is None:
                 return None
-            caption_response = requests.get(caption_url, timeout=20)
+            caption_response = requests.get(
+                caption_url,
+                headers={
+                    "Accept-Language": "en-US",
+                    "Referer": "https://www.youtube.com/",
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                },
+                timeout=20,
+            )
             caption_response.raise_for_status()
             if len(caption_response.content) > MAX_SUBTITLE_BYTES:
                 return None
