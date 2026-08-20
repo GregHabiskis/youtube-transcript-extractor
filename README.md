@@ -88,6 +88,16 @@ Open `http://127.0.0.1:8000`.
 
 If the Vercel CLI is needed for local runtime emulation, run `pnpm dlx vercel@latest dev`.
 
+## Optional Vercel Proxy
+
+Vercel can use a trusted HTTP or HTTPS proxy only when YouTube blocks the direct server request. Add `YTDLP_PROXY_URL` in the Vercel project environment variables, then redeploy:
+
+```text
+YTDLP_PROXY_URL=https://proxy.example.com:8443
+```
+
+The application always tries direct yt-dlp extraction first and retries once through this proxy only for detected YouTube access restrictions. If the variable is absent, no proxy is used. Keep proxy credentials in Vercel's encrypted environment settings; they are never sent to the React frontend, API responses, or application logs. Do not commit `.env` files or proxy credentials.
+
 ## Usage
 
 1. Paste `https://www.youtube.com/@ExampleChannel` or an individual video URL.
@@ -130,7 +140,7 @@ Example request:
 }
 ```
 
-Successful responses include the video metadata, caption source, selected language, selected format, structured timestamped blocks, and a UTF-8 plain-text rendering. Failed responses include a safe diagnostic `code` such as `SUBTITLE_DOWNLOAD_FAILED` without exposing a traceback. Videos without usable captions return `status: "no_captions"` with a distinct code without aborting the browser batch.
+Successful responses include the video metadata, caption source, selected language, selected format, structured timestamped blocks, and a UTF-8 plain-text rendering. Failed responses include a safe diagnostic `code` such as `SUBTITLE_DOWNLOAD_FAILED`, `YOUTUBE_BLOCKED`, or `PROXY_RETRY_FAILED` without exposing a traceback or proxy credentials. Videos without usable captions return `status: "no_captions"` with a distinct code without aborting the browser batch.
 
 ## Deploying to Vercel
 
@@ -162,7 +172,7 @@ For a personal-only deployment, Vercel Deployment Protection can be enabled in p
 
 Transcript extraction depends on captions exposed by YouTube and yt-dlp. Private, deleted, age-restricted, members-only, geo-restricted, or login-required videos may fail without authentication. The application does not embed personal cookies or credentials.
 
-Vercel requests originate from cloud/datacenter IP addresses. YouTube may throttle or challenge those requests even when the same URL succeeds locally. A local Uvicorn run is the supported fallback for such cases. Current yt-dlp YouTube support may also require its recommended JavaScript challenge components/runtime.
+Vercel requests originate from cloud/datacenter IP addresses. YouTube may throttle or challenge those requests even when the same URL succeeds locally. Configure an approved trusted proxy with `YTDLP_PROXY_URL` when direct Vercel access is blocked. Current yt-dlp YouTube support may also require its recommended JavaScript challenge components/runtime.
 
 Each Vercel request processes one video and is bounded by the platform function duration. Failed videos can be retried independently; completed videos are not restarted.
 

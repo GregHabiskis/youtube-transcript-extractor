@@ -5,6 +5,7 @@ import httpx
 from api.index import app as vercel_app
 from backend.app import app
 from backend.transcripts.models import TranscriptBlock
+from backend.youtube.errors import TranscriptExtractionError
 from backend.youtube.models import VideoMetadata
 from backend.youtube.service import TranscriptOutput
 
@@ -96,3 +97,25 @@ def test_unexpected_transcript_errors_remain_internal(monkeypatch):
         "code": "INTERNAL_ERROR",
         "error": "The server could not complete that request.",
     }
+
+
+def test_proxy_credentials_never_reach_api_response(monkeypatch):
+    proxy_url = "https://user:secret@example-proxy.test:8443"
+
+    def fail(*_args):
+        raise TranscriptExtractionError(
+            "Transcript retrieval failed through the configured proxy.",
+            cause=RuntimeError(proxy_url),
+            code="PROXY_RETRY_FAILED",
+        )
+
+    monkeypatch.setattr("backend.app.youtube.extract_transcript", fail)
+    response = request(
+        "POST",
+        "/api/transcript",
+        json={"url": "https://www.youtube.com/watch?v=BaW_jenozKc", "language": "en"},
+    )
+
+    assert response.status_code == 502
+    assert proxy_url not in response.text
+    assert "secret" not in response.text

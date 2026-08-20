@@ -132,6 +132,7 @@ def test_service_prefers_manual_captions(monkeypatch):
     assert "hello" in result.transcript
     assert all(instance.options["skip_download"] for instance in FakeYoutubeDL.instances)
     assert all("extract_flat" not in instance.options for instance in FakeYoutubeDL.instances)
+    assert all("proxy" not in instance.options for instance in FakeYoutubeDL.instances)
 
 
 def test_service_falls_back_to_automatic_captions(monkeypatch):
@@ -168,49 +169,6 @@ def test_service_falls_back_to_automatic_captions(monkeypatch):
     assert result.source == "automatic"
     assert result.format == "json3"
     assert "automatic words" in result.transcript
-
-
-def test_service_retries_caption_client_when_default_has_no_tracks(monkeypatch):
-    class CaptionClientFallbackYoutubeDL(FakeYoutubeDL):
-        def extract_info(self, url, download=False):
-            self.info_calls.append((url, download))
-            info = {
-                "id": "BaW_jenozKc",
-                "title": "Caption client fallback",
-                "channel": "Example Channel",
-            }
-            if self.options.get("extractor_args"):
-                info["subtitles"] = {
-                    "en": [
-                        {
-                            "ext": "json3",
-                            "data": json.dumps(
-                                {
-                                    "events": [
-                                        {
-                                            "tStartMs": 0,
-                                            "dDurationMs": 1000,
-                                            "segs": [{"utf8": "fallback captions"}],
-                                        }
-                                    ]
-                                }
-                            ),
-                        }
-                    ]
-                }
-            return info
-
-    FakeYoutubeDL.instances.clear()
-    monkeypatch.setattr("backend.youtube.service.YoutubeDL", CaptionClientFallbackYoutubeDL)
-    result = YouTubeService().extract_transcript("https://youtu.be/BaW_jenozKc", "en")
-
-    assert result.status == "complete"
-    assert "fallback captions" in result.transcript
-    assert len(CaptionClientFallbackYoutubeDL.instances) == 2
-    assert "extractor_args" not in CaptionClientFallbackYoutubeDL.instances[0].options
-    assert CaptionClientFallbackYoutubeDL.instances[1].options["extractor_args"] == {
-        "youtube": {"player_client": ["web_embedded"]}
-    }
 
 
 def test_service_matches_english_variant_and_preserves_manual_priority(monkeypatch):
@@ -308,130 +266,125 @@ def test_service_reports_true_no_caption_case(monkeypatch):
             self.info_calls.append((url, download))
             return {"id": "BaW_jenozKc", "title": "No captions"}
 
-    class EmptyTranscriptApi:
-        def list(self, _video_id):
-            return []
-
     monkeypatch.setattr("backend.youtube.service.YoutubeDL", NoCaptionYoutubeDL)
-    monkeypatch.setattr(
-        YouTubeService,
-        "_extract_innertube_fallback",
-        staticmethod(lambda *_args: None),
-    )
-    monkeypatch.setattr("backend.youtube.service.YouTubeTranscriptApi", EmptyTranscriptApi)
     result = YouTubeService().extract_transcript("https://youtu.be/BaW_jenozKc", "en")
     assert result.status == "no_captions"
     assert result.code == "NO_CAPTIONS"
+    assert result.reason == "No captions are available for this video."
 
 
-def test_service_uses_transcript_api_when_yt_dlp_has_no_tracks(monkeypatch):
-    class NoTrackYoutubeDL(FakeYoutubeDL):
+def test_direct_failure_without_proxy_returns_blocked_error(monkeypatch):
+    class BlockedYoutubeDL(FakeYoutubeDL):
         def extract_info(self, url, download=False):
             self.info_calls.append((url, download))
+            raise RuntimeError("HTTP Error 429: Sign in to confirm you are not a bot")
+
+    monkeypatch.delenv("YTDLP_PROXY_URL", raising=False)
+    monkeypatch.setattr("backend.youtube.service.YoutubeDL", BlockedYoutubeDL)
+
+    with pytest.raises(
+        TranscriptExtractionError, match="YouTube blocked transcript retrieval"
+    ) as error:
+        YouTubeService().extract_transcript("https://youtu.be/BaW_jenozKc", "en")
+    assert error.value.code == "YOUTUBE_BLOCKED"
+
+
+def test_direct_failure_retries_once_through_proxy(monkeypatch):
+    class DirectThenProxyYoutubeDL(FakeYoutubeDL):
+        def extract_info(self, url, download=False):
+            self.info_calls.append((url, download))
+            if self.options.get("proxy") is None:
+                raise RuntimeError("HTTP Error 429: Sign in to confirm you are not a bot")
             return {
                 "id": "BaW_jenozKc",
-                "title": "Transcript API fallback",
+                "title": "Proxy success",
                 "channel": "Example Channel",
+                "subtitles": {
+                    "en": [
+                        {
+                            "ext": "json3",
+                            "data": json.dumps(
+                                {
+                                    "events": [
+                                        {
+                                            "tStartMs": 0,
+                                            "dDurationMs": 1000,
+                                            "segs": [{"utf8": "proxy words"}],
+                                        }
+                                    ]
+                                }
+                            ),
+                        }
+                    ]
+                },
             }
 
-    class FakeTranscript:
-        language_code = "en"
-        is_generated = False
+    monkeypatch.setenv("YTDLP_PROXY_URL", "https://user:secret@example-proxy.test:8443")
+    monkeypatch.setattr("backend.youtube.service.YoutubeDL", DirectThenProxyYoutubeDL)
+    FakeYoutubeDL.instances.clear()
+    result = YouTubeService().extract_transcript("https://youtu.be/BaW_jenozKc", "en")
 
-        def fetch(self):
-            return [
-                type(
-                    "Snippet",
-                    (),
-                    {"text": "fallback words", "start": 0.0, "duration": 1.0},
-                )()
-            ]
-
-    class FallbackTranscriptApi:
-        def list(self, video_id):
-            assert video_id == "BaW_jenozKc"
-            return [FakeTranscript()]
-
-    monkeypatch.setattr("backend.youtube.service.YoutubeDL", NoTrackYoutubeDL)
-    monkeypatch.setattr(
-        YouTubeService,
-        "_extract_innertube_fallback",
-        staticmethod(lambda *_args: None),
+    assert result.status == "complete"
+    assert "proxy words" in result.transcript
+    assert len(DirectThenProxyYoutubeDL.instances) == 2
+    assert DirectThenProxyYoutubeDL.instances[0].options.get("proxy") is None
+    assert DirectThenProxyYoutubeDL.instances[1].options["proxy"] == (
+        "https://user:secret@example-proxy.test:8443"
     )
-    monkeypatch.setattr("backend.youtube.service.YouTubeTranscriptApi", FallbackTranscriptApi)
-    result = YouTubeService().extract_transcript("https://youtu.be/BaW_jenozKc", "en")
-
-    assert result.status == "complete"
-    assert result.source == "manual"
-    assert result.language == "en"
-    assert result.format is None
-    assert "fallback words" in result.transcript
 
 
-def test_service_uses_innertube_when_caption_clients_have_no_tracks(monkeypatch):
-    class NoTrackYoutubeDL(FakeYoutubeDL):
+def test_direct_failure_proxy_retry_failure_is_structured(monkeypatch):
+    class AlwaysBlockedYoutubeDL(FakeYoutubeDL):
         def extract_info(self, url, download=False):
             self.info_calls.append((url, download))
-            return {
-                "id": "BaW_jenozKc",
-                "title": "InnerTube fallback",
-                "channel": "Example Channel",
-            }
+            raise RuntimeError("HTTP Error 403: Forbidden")
 
-    class FakeResponse:
-        def __init__(self, payload=None, content=b""):
-            self.payload = payload
-            self.content = content
+    monkeypatch.setenv("YTDLP_PROXY_URL", "https://user:secret@example-proxy.test:8443")
+    monkeypatch.setattr("backend.youtube.service.YoutubeDL", AlwaysBlockedYoutubeDL)
 
-        def raise_for_status(self):
-            return None
+    with pytest.raises(
+        TranscriptExtractionError,
+        match="Transcript retrieval failed through the configured proxy",
+    ) as error:
+        YouTubeService().extract_transcript("https://youtu.be/BaW_jenozKc", "en")
+    assert error.value.code == "PROXY_RETRY_FAILED"
+    assert "secret" not in error.value.public_message
 
-        def json(self):
-            return self.payload
 
-    caption_data = json.dumps(
-        {
-            "events": [
-                {
-                    "tStartMs": 0,
-                    "dDurationMs": 1000,
-                    "segs": [{"utf8": "InnerTube words"}],
-                }
-            ]
-        }
-    ).encode()
+def test_genuine_no_captions_does_not_trigger_proxy(monkeypatch):
+    class NoCaptionYoutubeDL(FakeYoutubeDL):
+        def extract_info(self, url, download=False):
+            self.info_calls.append((url, download))
+            return {"id": "BaW_jenozKc", "title": "No captions"}
 
-    def fake_post(url, **_kwargs):
-        assert url.endswith("/youtubei/v1/player")
-        return FakeResponse(
-            payload={
-                "captions": {
-                    "playerCaptionsTracklistRenderer": {
-                        "captionTracks": [
-                            {
-                                "languageCode": "en",
-                                "baseUrl": "https://www.youtube.com/api/timedtext?v=BaW_jenozKc",
-                            }
-                        ]
-                    }
-                }
-            }
-        )
-
-    def fake_get(url, **_kwargs):
-        assert "fmt=json3" in url
-        return FakeResponse(content=caption_data)
-
-    monkeypatch.setattr("backend.youtube.service.YoutubeDL", NoTrackYoutubeDL)
-    monkeypatch.setattr("backend.youtube.service.requests.post", fake_post)
-    monkeypatch.setattr("backend.youtube.service.requests.get", fake_get)
+    monkeypatch.setenv("YTDLP_PROXY_URL", "https://user:secret@example-proxy.test:8443")
+    monkeypatch.setattr("backend.youtube.service.YoutubeDL", NoCaptionYoutubeDL)
+    FakeYoutubeDL.instances.clear()
     result = YouTubeService().extract_transcript("https://youtu.be/BaW_jenozKc", "en")
 
-    assert result.status == "complete"
-    assert result.source == "manual"
-    assert result.language == "en"
-    assert result.format == "json3"
-    assert "InnerTube words" in result.transcript
+    assert result.status == "no_captions"
+    assert result.code == "NO_CAPTIONS"
+    assert len(NoCaptionYoutubeDL.instances) == 1
+
+
+def test_proxy_credentials_are_not_exposed_in_error_response(monkeypatch, caplog):
+    class BlockedYoutubeDL(FakeYoutubeDL):
+        def extract_info(self, url, download=False):
+            self.info_calls.append((url, download))
+            raise RuntimeError(
+                "HTTP Error 403: proxy request failed for https://user:secret@example-proxy.test"
+            )
+
+    proxy_url = "https://user:secret@example-proxy.test:8443"
+    monkeypatch.setenv("YTDLP_PROXY_URL", proxy_url)
+    monkeypatch.setattr("backend.youtube.service.YoutubeDL", BlockedYoutubeDL)
+
+    with pytest.raises(TranscriptExtractionError) as error:
+        YouTubeService().extract_transcript("https://youtu.be/BaW_jenozKc", "en")
+    assert proxy_url not in error.value.public_message
+    assert "secret" not in error.value.public_message
+    assert proxy_url not in caplog.text
+    assert "secret" not in caplog.text
 
 
 def test_service_distinguishes_missing_requested_language(monkeypatch):

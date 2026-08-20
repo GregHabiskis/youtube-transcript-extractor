@@ -1,22 +1,20 @@
 from __future__ import annotations
 
 import logging
-import math
+import os
 import re
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit
 
-import requests
-from youtube_transcript_api import YouTubeTranscriptApi
 from yt_dlp import YoutubeDL
 from yt_dlp.networking import Request
 from yt_dlp.utils import DownloadError, ExtractorError
 
 from backend.transcripts.cleaner import clean_cues, merge_paragraphs
 from backend.transcripts.json3 import SubtitleParseError, parse_json3
-from backend.transcripts.models import TranscriptBlock, TranscriptCue
+from backend.transcripts.models import TranscriptBlock
 from backend.transcripts.renderer import render_plaintext
 from backend.transcripts.vtt import parse_vtt
 
@@ -37,15 +35,28 @@ MAX_SUBTITLE_BYTES = 8 * 1024 * 1024
 
 
 class _YtDlpLogger:
+    def __init__(self, proxy_url: str | None = None) -> None:
+        self.messages: list[str] = []
+        self.proxy_url = proxy_url or _configured_proxy_url()
+
     def debug(self, message: str) -> None:
         if message.startswith("[debug] "):
-            logger.debug("yt-dlp %s", message[8:])
+            logger.debug("yt-dlp %s", _redact_proxy_text(message[8:], self.proxy_url))
 
     def warning(self, message: str) -> None:
-        logger.warning("yt-dlp: %s", message)
+        self.messages.append(message)
+        logger.warning("yt-dlp: %s", _redact_proxy_text(message, self.proxy_url))
 
     def error(self, message: str) -> None:
-        logger.error("yt-dlp: %s", message)
+        self.messages.append(message)
+        logger.error("yt-dlp: %s", _redact_proxy_text(message, self.proxy_url))
+
+    def record(self, message: str) -> None:
+        self.messages.append(message)
+
+    @property
+    def indicates_blocking(self) -> bool:
+        return any(_is_youtube_blocked_text(message) for message in self.messages)
 
 
 class TranscriptOutput:
@@ -191,13 +202,102 @@ class YouTubeService:
                 "Transcript extraction requires an individual YouTube video URL."
             )
         language = validate_language(language)
+        proxy_url = _configured_proxy_url()
+        direct_result, direct_error, direct_diagnostics = self._run_transcript_attempt(
+            normalized.url, language, proxy_url=None
+        )
+        if direct_error is None:
+            if direct_result is not None and direct_result.status == "no_captions":
+                if not direct_diagnostics.indicates_blocking:
+                    return direct_result
+                if not proxy_url:
+                    raise TranscriptExtractionError(
+                        "YouTube blocked transcript retrieval from this server.",
+                        cause=RuntimeError("direct caption retrieval was blocked"),
+                        code="YOUTUBE_BLOCKED",
+                    )
+            elif direct_result is not None:
+                return direct_result
+        elif not _is_youtube_blocked_error(direct_error, direct_diagnostics):
+            raise direct_error
+
+        if not proxy_url:
+            raise TranscriptExtractionError(
+                "YouTube blocked transcript retrieval from this server.",
+                cause=direct_error or RuntimeError("direct caption retrieval was blocked"),
+                code="YOUTUBE_BLOCKED",
+            )
+        return self._retry_transcript_through_proxy(normalized.url, language, proxy_url)
+
+    def _run_transcript_attempt(
+        self, raw_url: str, language: str, *, proxy_url: str | None
+    ) -> tuple[TranscriptOutput | None, Exception | None, _YtDlpLogger]:
+        diagnostics = _YtDlpLogger(proxy_url)
+        attempt = "proxy" if proxy_url else "direct"
+        logger.debug("yt_dlp_stage=transcript_attempt_start attempt=%s", attempt)
+        try:
+            result = self._extract_transcript_once(
+                raw_url,
+                language,
+                proxy_url=proxy_url,
+                diagnostics=diagnostics,
+            )
+        except Exception as exc:
+            return None, exc, diagnostics
+        logger.debug("yt_dlp_stage=transcript_attempt_ok attempt=%s", attempt)
+        return result, None, diagnostics
+
+    def _retry_transcript_through_proxy(
+        self, raw_url: str, language: str, proxy_url: str
+    ) -> TranscriptOutput:
+        result, error, _diagnostics = self._run_transcript_attempt(
+            raw_url, language, proxy_url=proxy_url
+        )
+        if error is not None or result is None or result.status == "no_captions":
+            cause = error or RuntimeError("the configured proxy returned no usable captions")
+            logger.warning(
+                "yt_dlp_stage=transcript_proxy_failed exception_type=%s message=%s",
+                type(cause).__name__,
+                _safe_error_message(cause, proxy_url=proxy_url),
+            )
+            raise TranscriptExtractionError(
+                "Transcript retrieval failed through the configured proxy.",
+                cause=cause,
+                code="PROXY_RETRY_FAILED",
+            ) from cause
+        return result
+
+    def _extract_transcript_once(
+        self,
+        raw_url: str,
+        language: str,
+        *,
+        proxy_url: str | None,
+        diagnostics: _YtDlpLogger,
+    ) -> TranscriptOutput:
+        normalized = normalize_youtube_url(raw_url)
+        if normalized.kind != "video":
+            raise InvalidYouTubeURL(
+                "Transcript extraction requires an individual YouTube video URL."
+            )
+        language = validate_language(language)
 
         try:
-            info = self._extract_info(normalized.url, self._transcript_options())
+            info = self._extract_info(
+                normalized.url,
+                self._transcript_options(proxy_url, diagnostics),
+                proxy_url=proxy_url,
+                diagnostics=diagnostics,
+            )
         except YouTubeServiceError:
             raise
         except Exception as exc:
-            logger.exception("Transcript extraction failed for %s", normalized.url)
+            logger.error(
+                "Transcript extraction failed attempt=%s exception_type=%s message=%s",
+                "proxy" if proxy_url else "direct",
+                type(exc).__name__,
+                _safe_error_message(exc, proxy_url=proxy_url or _configured_proxy_url()),
+            )
             raise TranscriptExtractionError(
                 _public_yt_error(exc, "Could not extract this video."),
                 cause=exc,
@@ -217,32 +317,6 @@ class YouTubeService:
             )
         manual_languages = _language_keys(info.get("subtitles"))
         automatic_languages = _language_keys(info.get("automatic_captions"))
-        if not manual_languages and not automatic_languages:
-            fallback_info = self._extract_caption_client_fallback(
-                f"https://www.youtube-nocookie.com/embed/{video.id}"
-            )
-            if fallback_info is not None:
-                fallback_manual_languages = _language_keys(fallback_info.get("subtitles"))
-                fallback_automatic_languages = _language_keys(
-                    fallback_info.get("automatic_captions")
-                )
-                if fallback_manual_languages or fallback_automatic_languages:
-                    fallback_video = self._video_from_info(
-                        fallback_info, fallback_url=normalized.url, index=1
-                    )
-                    if fallback_video is not None:
-                        info = fallback_info
-                        video = fallback_video
-                        manual_languages = fallback_manual_languages
-                        automatic_languages = fallback_automatic_languages
-        if not manual_languages and not automatic_languages:
-            innertube_result = self._extract_innertube_fallback(video, language)
-            if innertube_result is not None:
-                return innertube_result
-        if not manual_languages and not automatic_languages:
-            transcript_api_result = self._extract_transcript_api_fallback(video, language)
-            if transcript_api_result is not None:
-                return transcript_api_result
         logger.debug(
             "yt_dlp_stage=caption_discovery video_id=%s manual_languages=%s "
             "automatic_language_count=%d automatic_sample=%s",
@@ -281,21 +355,30 @@ class YouTubeService:
                 transcript="",
                 status="no_captions",
                 reason=(
-                    "No captions were found for the selected language."
-                    if language != "auto"
-                    else "No captions are available for this video."
+                    "No captions are available for this video."
+                    if code == "NO_CAPTIONS"
+                    else "No captions were found for the selected language."
                 ),
                 code=code,
             )
 
         try:
-            cues = self._download_and_parse_track(track, info)
+            cues = self._download_and_parse_track(
+                track, info, proxy_url=proxy_url, diagnostics=diagnostics
+            )
             cleaned = clean_cues(cues)
             blocks = merge_paragraphs(cleaned)
         except TranscriptExtractionError:
             raise
         except Exception as exc:
-            logger.exception("Transcript post-processing failed video_id=%s", video.id)
+            logger.error(
+                "Transcript post-processing failed attempt=%s video_id=%s "
+                "exception_type=%s message=%s",
+                "proxy" if proxy_url else "direct",
+                video.id,
+                type(exc).__name__,
+                _safe_error_message(exc, proxy_url=proxy_url or _configured_proxy_url()),
+            )
             raise TranscriptExtractionError(
                 "The caption text could not be processed.", cause=exc, code="INTERNAL_ERROR"
             ) from exc
@@ -337,230 +420,15 @@ class YouTubeService:
             format=str(track.get("ext", "")).lower() or None,
         )
 
-    def _extract_caption_client_fallback(self, url: str) -> Mapping[str, Any] | None:
-        options = self._transcript_options()
-        options["extractor_args"] = {"youtube": {"player_client": ["web_embedded"]}}
-        logger.debug(
-            "yt_dlp_stage=caption_client_fallback_start client=web_embedded "
-            "url_kind=embed"
-        )
-        try:
-            info = self._extract_info(url, options)
-        except Exception as exc:
-            logger.warning(
-                "yt_dlp_stage=caption_client_fallback_failed client=web_embedded "
-                "exception_type=%s message=%s",
-                type(exc).__name__,
-                _safe_error_message(exc),
-            )
-            return None
-        logger.debug(
-            "yt_dlp_stage=caption_client_fallback_ok client=web_embedded manual=%d automatic=%d",
-            len(_language_keys(info.get("subtitles"))),
-            len(_language_keys(info.get("automatic_captions"))),
-        )
-        return info
-
-    @staticmethod
-    def _extract_innertube_fallback(
-        video: VideoMetadata, requested_language: str
-    ) -> TranscriptOutput | None:
-        logger.debug(
-            "yt_dlp_stage=innertube_fallback_start video_id=%s requested_language=%s",
-            video.id,
-            requested_language,
-        )
-        try:
-            request_data = {
-                "context": {
-                    "client": {"clientName": "ANDROID", "clientVersion": "20.10.38"}
-                },
-                "videoId": video.id,
-            }
-            request_headers = {
-                "Accept-Language": "en-US",
-                "Content-Type": "application/json",
-                "User-Agent": "com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip",
-                "X-YouTube-Client-Name": "3",
-                "X-YouTube-Client-Version": "20.10.38",
-            }
-            tracks: Any = []
-            last_error: Exception | None = None
-            for api_host in ("https://youtubei.googleapis.com", "https://www.youtube.com"):
-                try:
-                    response = requests.post(
-                        f"{api_host}/youtubei/v1/player",
-                        headers=request_headers,
-                        json=request_data,
-                        timeout=20,
-                    )
-                    response.raise_for_status()
-                    payload = response.json()
-                    tracks = (
-                        payload.get("captions", {})
-                        .get("playerCaptionsTracklistRenderer", {})
-                        .get("captionTracks", [])
-                    )
-                    if isinstance(tracks, Sequence) and not isinstance(tracks, (str, bytes)):
-                        if tracks:
-                            logger.debug(
-                                "yt_dlp_stage=innertube_fallback_tracks host=%s count=%d",
-                                api_host,
-                                len(tracks),
-                            )
-                            break
-                    else:
-                        tracks = []
-                except Exception as exc:
-                    last_error = exc
-                    logger.debug(
-                        "yt_dlp_stage=innertube_fallback_host_failed host=%s "
-                        "exception_type=%s message=%s",
-                        api_host,
-                        type(exc).__name__,
-                        _safe_error_message(exc),
-                    )
-            else:
-                if last_error is not None:
-                    raise last_error
-            if not isinstance(tracks, Sequence) or isinstance(tracks, (str, bytes)):
-                return None
-            selected = _select_innertube_track(tracks, requested_language)
-            if selected is None:
-                logger.debug(
-                    "yt_dlp_stage=innertube_fallback_no_track video_id=%s available=%d",
-                    video.id,
-                    len(tracks),
-                )
-                return None
-            caption_url = _json3_caption_url(selected.get("baseUrl"))
-            if caption_url is None:
-                return None
-            caption_response = requests.get(
-                caption_url,
-                headers={
-                    "Accept-Language": "en-US",
-                    "Referer": "https://www.youtube.com/",
-                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                },
-                timeout=20,
-            )
-            caption_response.raise_for_status()
-            if len(caption_response.content) > MAX_SUBTITLE_BYTES:
-                return None
-            raw_data = caption_response.content.decode("utf-8-sig", errors="replace")
-            try:
-                cues = parse_json3(raw_data)
-            except SubtitleParseError:
-                cues = parse_vtt(raw_data)
-            cleaned = clean_cues(cues)
-            blocks = merge_paragraphs(cleaned)
-            if not blocks:
-                return None
-            source = "automatic" if str(selected.get("kind", "")).casefold() == "asr" else "manual"
-            language = str(selected.get("languageCode", ""))
-            transcript = render_plaintext(
-                title=video.title,
-                channel=video.channel,
-                url=video.url,
-                upload_date=video.upload_date,
-                source=source,
-                language=language,
-                blocks=blocks,
-            )
-            logger.debug(
-                "yt_dlp_stage=innertube_fallback_ok video_id=%s source=%s language=%s "
-                "cues=%d blocks=%d",
-                video.id,
-                source,
-                language,
-                len(cues),
-                len(blocks),
-            )
-            return TranscriptOutput(
-                video=video,
-                source=source,
-                language=language,
-                blocks=blocks,
-                transcript=transcript,
-                format="json3",
-            )
-        except Exception as exc:
-            logger.warning(
-                "yt_dlp_stage=innertube_fallback_failed video_id=%s exception_type=%s message=%s",
-                video.id,
-                type(exc).__name__,
-                _safe_error_message(exc),
-            )
-            return None
-
-    @staticmethod
-    def _extract_transcript_api_fallback(
-        video: VideoMetadata, requested_language: str
-    ) -> TranscriptOutput | None:
-        logger.debug(
-            "yt_dlp_stage=transcript_api_fallback_start video_id=%s requested_language=%s",
-            video.id,
-            requested_language,
-        )
-        try:
-            transcript_list = list(YouTubeTranscriptApi().list(video.id))
-            selected = _select_transcript_api_track(transcript_list, requested_language)
-            if selected is None:
-                logger.debug(
-                    "yt_dlp_stage=transcript_api_fallback_no_track video_id=%s available=%d",
-                    video.id,
-                    len(transcript_list),
-                )
-                return None
-            snippets = selected.fetch()
-            cues = _transcript_api_cues(snippets)
-            cleaned = clean_cues(cues)
-            blocks = merge_paragraphs(cleaned)
-            if not blocks:
-                return None
-            source = "automatic" if bool(selected.is_generated) else "manual"
-            language = str(selected.language_code)
-            transcript = render_plaintext(
-                title=video.title,
-                channel=video.channel,
-                url=video.url,
-                upload_date=video.upload_date,
-                source=source,
-                language=language,
-                blocks=blocks,
-            )
-            logger.debug(
-                "yt_dlp_stage=transcript_api_fallback_ok video_id=%s source=%s "
-                "language=%s cues=%d blocks=%d",
-                video.id,
-                source,
-                language,
-                len(cues),
-                len(blocks),
-            )
-            return TranscriptOutput(
-                video=video,
-                source=source,
-                language=language,
-                blocks=blocks,
-                transcript=transcript,
-            )
-        except Exception as exc:
-            logger.warning(
-                "yt_dlp_stage=transcript_api_fallback_failed video_id=%s "
-                "exception_type=%s message=%s",
-                video.id,
-                type(exc).__name__,
-                _safe_error_message(exc),
-            )
-            return None
-
     def _extract_info(
-        self, url: str, extra_options: Mapping[str, Any] | None = None
+        self,
+        url: str,
+        extra_options: Mapping[str, Any] | None = None,
+        *,
+        proxy_url: str | None = None,
+        diagnostics: _YtDlpLogger | None = None,
     ) -> Mapping[str, Any]:
-        options = self._base_options()
+        options = self._base_options(proxy_url=proxy_url, diagnostics=diagnostics)
         if extra_options:
             options.update(extra_options)
         mode = (
@@ -589,8 +457,10 @@ class YouTubeService:
         return result
 
     @staticmethod
-    def _base_options() -> dict[str, Any]:
-        return {
+    def _base_options(
+        *, proxy_url: str | None = None, diagnostics: _YtDlpLogger | None = None
+    ) -> dict[str, Any]:
+        options = {
             "quiet": True,
             "no_warnings": True,
             "skip_download": True,
@@ -601,8 +471,11 @@ class YouTubeService:
             "check_formats": False,
             "js_runtimes": {"node": {}},
             "remote_components": {"ejs:github"},
-            "logger": _YtDlpLogger(),
+            "logger": diagnostics or _YtDlpLogger(proxy_url),
         }
+        if proxy_url:
+            options["proxy"] = proxy_url
+        return options
 
     @staticmethod
     def _discovery_options(latest_videos: int) -> dict[str, Any]:
@@ -619,8 +492,12 @@ class YouTubeService:
         return options
 
     @staticmethod
-    def _transcript_options() -> dict[str, Any]:
-        options = YouTubeService._base_options()
+    def _transcript_options(
+        proxy_url: str | None = None, diagnostics: _YtDlpLogger | None = None
+    ) -> dict[str, Any]:
+        options = YouTubeService._base_options(
+            proxy_url=proxy_url, diagnostics=diagnostics
+        )
         options.update(
             {
                 "noplaylist": True,
@@ -673,7 +550,13 @@ class YouTubeService:
         )
 
     @staticmethod
-    def _download_and_parse_track(track: Mapping[str, Any], info: Mapping[str, Any]) -> list:
+    def _download_and_parse_track(
+        track: Mapping[str, Any],
+        info: Mapping[str, Any],
+        *,
+        proxy_url: str | None = None,
+        diagnostics: _YtDlpLogger | None = None,
+    ) -> list:
         extension = str(track.get("ext", "")).lower()
         raw_data = track.get("data")
         if raw_data is None:
@@ -687,7 +570,9 @@ class YouTubeService:
                     "yt-dlp returned a caption URL outside YouTube.",
                     code="SUBTITLE_ACCESS_FAILED",
                 )
-            options = YouTubeService._base_options()
+            options = YouTubeService._base_options(
+                proxy_url=proxy_url, diagnostics=diagnostics
+            )
             headers: dict[str, str] = {}
             for header_group in (info.get("http_headers"), track.get("http_headers")):
                 if isinstance(header_group, Mapping):
@@ -707,13 +592,15 @@ class YouTubeService:
                         with suppress(Exception):
                             response.close()
             except Exception as exc:
+                if diagnostics is not None:
+                    diagnostics.record(str(exc))
                 logger.error(
                     "yt_dlp_stage=subtitle_download_failed video_id=%s format=%s "
                     "exception_type=%s message=%s",
                     info.get("id"),
                     extension,
                     type(exc).__name__,
-                    _safe_error_message(exc),
+                    _safe_error_message(exc, proxy_url=proxy_url),
                 )
                 raise TranscriptExtractionError(
                     _public_yt_error(exc, "YouTube did not return the selected captions."),
@@ -830,97 +717,6 @@ def _select_track(
     return None, None, None
 
 
-def _select_transcript_api_track(
-    transcripts: Sequence[Any], requested_language: str
-) -> Any | None:
-    requested = requested_language.casefold().replace("_", "-")
-    for is_generated in (False, True):
-        candidates = [
-            transcript
-            for transcript in transcripts
-            if bool(getattr(transcript, "is_generated", False)) is is_generated
-        ]
-        ranked = sorted(
-            candidates,
-            key=lambda transcript: (
-                _language_score(getattr(transcript, "language_code", ""), requested),
-                str(getattr(transcript, "language_code", "")),
-            ),
-        )
-        if requested != "auto":
-            ranked = [
-                transcript
-                for transcript in ranked
-                if _language_score(getattr(transcript, "language_code", ""), requested) < 100
-            ]
-        if ranked:
-            return ranked[0]
-    return None
-
-
-def _select_innertube_track(
-    tracks: Sequence[Any], requested_language: str
-) -> Mapping[str, Any] | None:
-    requested = requested_language.casefold().replace("_", "-")
-    for is_generated in (False, True):
-        candidates = [
-            track
-            for track in tracks
-            if isinstance(track, Mapping)
-            and (str(track.get("kind", "")).casefold() == "asr") is is_generated
-        ]
-        ranked = sorted(
-            candidates,
-            key=lambda track: (
-                _language_score(track.get("languageCode", ""), requested),
-                str(track.get("languageCode", "")),
-            ),
-        )
-        if requested != "auto":
-            ranked = [
-                track
-                for track in ranked
-                if _language_score(track.get("languageCode", ""), requested) < 100
-            ]
-        if ranked:
-            return ranked[0]
-    return None
-
-
-def _json3_caption_url(value: Any) -> str | None:
-    if not isinstance(value, str) or not _is_allowed_caption_url(value):
-        return None
-    parts = urlsplit(value)
-    query = [
-        (key, item)
-        for key, item in parse_qsl(parts.query, keep_blank_values=True)
-        if key != "fmt"
-    ]
-    query.append(("fmt", "json3"))
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
-
-
-def _transcript_api_cues(snippets: Sequence[Any]) -> list[TranscriptCue]:
-    cues: list[TranscriptCue] = []
-    for snippet in snippets:
-        if isinstance(snippet, Mapping):
-            text = _string_value(snippet.get("text"))
-            start_seconds = _number_value(snippet.get("start"))
-            duration_seconds = _number_value(snippet.get("duration"))
-        else:
-            text = _string_value(getattr(snippet, "text", None))
-            start_seconds = _number_value(getattr(snippet, "start", None))
-            duration_seconds = _number_value(getattr(snippet, "duration", None))
-        if not text or start_seconds is None or duration_seconds is None:
-            continue
-        if not math.isfinite(start_seconds) or not math.isfinite(duration_seconds):
-            continue
-        start_ms = max(0, round(start_seconds * 1000))
-        end_ms = max(start_ms + 1, round((start_seconds + max(0, duration_seconds)) * 1000))
-        cues.append(TranscriptCue(start_ms=start_ms, end_ms=end_ms, text=text))
-    return cues
-
-
 def _language_keys(value: Any) -> list[str]:
     if not isinstance(value, Mapping):
         return []
@@ -1019,6 +815,70 @@ def _format_upload_date(value: Any) -> str | None:
     return raw
 
 
+def _configured_proxy_url() -> str | None:
+    value = os.environ.get("YTDLP_PROXY_URL", "").strip()
+    return value or None
+
+
+def _is_youtube_blocked_text(value: Any) -> bool:
+    text = str(value).casefold()
+    return any(
+        marker in text
+        for marker in (
+            "http error 403",
+            "http error 429",
+            "too many requests",
+            "rate limit",
+            "sign in to confirm",
+            "not a bot",
+            "bot detected",
+            "captcha",
+            "request blocked",
+            "ip blocked",
+            "n challenge solving failed",
+            "signature solving failed",
+            "no supported javascript runtime",
+        )
+    )
+
+
+def _is_youtube_blocked_error(error: Exception, diagnostics: _YtDlpLogger) -> bool:
+    if isinstance(error, TranscriptExtractionError) and error.code in {
+        "SUBTITLE_PARSE_FAILED",
+        "INTERNAL_ERROR",
+    }:
+        return False
+    if diagnostics.indicates_blocking:
+        return True
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if _is_youtube_blocked_text(current):
+            return True
+        current = getattr(current, "cause", None) or current.__cause__
+    return False
+
+
+def _redact_proxy_text(message: str, proxy_url: str | None) -> str:
+    if not proxy_url:
+        return message
+    redacted = message.replace(proxy_url, "[configured proxy]")
+    try:
+        parsed = urlsplit(proxy_url)
+        authority = parsed.netloc
+    except ValueError:
+        parsed = None
+        authority = ""
+    if authority:
+        redacted = redacted.replace(authority, "[configured proxy]")
+    if parsed is not None:
+        for sensitive in (parsed.username, parsed.password):
+            if sensitive:
+                redacted = redacted.replace(unquote(sensitive), "[redacted]")
+    return redacted
+
+
 def _public_yt_error(error: Exception, fallback: str) -> str:
     text = str(error).casefold()
     if "429" in text or "too many requests" in text or "rate limit" in text:
@@ -1039,10 +899,10 @@ def _public_yt_error(error: Exception, fallback: str) -> str:
     return fallback
 
 
-def _safe_error_message(error: Exception) -> str:
+def _safe_error_message(error: Exception, *, proxy_url: str | None = None) -> str:
     """Keep diagnostic messages useful without logging signed caption URLs."""
 
-    message = str(error)
+    message = _redact_proxy_text(str(error), proxy_url)
     if "?" in message:
         message = message.split("?", 1)[0] + "?…"
     return message[:500]
