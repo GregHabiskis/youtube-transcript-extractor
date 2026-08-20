@@ -75,6 +75,8 @@ Terminal 1:
 uv run uvicorn backend.app:app --host 127.0.0.1 --port 8000
 ```
 
+For detailed local yt-dlp/caption pipeline diagnostics, set `YTVID_LOG_LEVEL=DEBUG` before starting FastAPI.
+
 Terminal 2:
 
 ```bash
@@ -136,7 +138,7 @@ Example request:
 }
 ```
 
-Successful responses include the video metadata, caption source, selected language, structured timestamped blocks, and a UTF-8 plain-text rendering. Videos without usable captions return `status: "no_captions"` without aborting the browser batch.
+Successful responses include the video metadata, caption source, selected language, selected format, structured timestamped blocks, and a UTF-8 plain-text rendering. Failed responses include a safe diagnostic `code` such as `SUBTITLE_DOWNLOAD_FAILED` without exposing a traceback. Videos without usable captions return `status: "no_captions"` with a distinct code without aborting the browser batch.
 
 ## Deploying to Vercel
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -11,7 +12,11 @@ from backend.api_models import InspectRequest, TranscriptRequest
 from backend.youtube.errors import InvalidYouTubeURL, TranscriptExtractionError, YouTubeServiceError
 from backend.youtube.service import YouTubeService
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log_level = os.environ.get("YTVID_LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, log_level, logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -69,12 +74,14 @@ def transcript(request: TranscriptRequest) -> dict:
     except TranscriptExtractionError as exc:
         logger.warning("Transcript request failed: %s", exc.public_message)
         return JSONResponse(
-            status_code=502, content={"status": "failed", "error": exc.public_message}
+            status_code=502,
+            content={"status": "failed", "code": exc.code, "error": exc.public_message},
         )
     except YouTubeServiceError as exc:
         logger.warning("Transcript request rejected: %s", exc.public_message)
         return JSONResponse(
-            status_code=502, content={"status": "failed", "error": exc.public_message}
+            status_code=502,
+            content={"status": "failed", "code": exc.code, "error": exc.public_message},
         )
     return result.to_dict()
 
@@ -84,7 +91,11 @@ async def unhandled_error(_request, exc: Exception) -> JSONResponse:
     logger.exception("Unhandled API error")
     return JSONResponse(
         status_code=500,
-        content={"status": "failed", "error": "The server could not complete that request."},
+        content={
+            "status": "failed",
+            "code": "INTERNAL_ERROR",
+            "error": "The server could not complete that request.",
+        },
     )
 
 

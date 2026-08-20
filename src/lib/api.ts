@@ -1,7 +1,7 @@
 import type { InspectionResult, TranscriptResult } from "./types";
 
 export class ApiRequestError extends Error {
-  constructor(message: string, public readonly status: number) {
+  constructor(message: string, public readonly status: number, public readonly code?: string) {
     super(message);
     this.name = "ApiRequestError";
   }
@@ -43,7 +43,11 @@ async function requestJson<T>(path: string, body?: unknown): Promise<T> {
       (payload && typeof payload.error === "string" && payload.error) ||
       validationMessage ||
       fallbackMessage;
-    throw new ApiRequestError(message, response.status);
+    throw new ApiRequestError(
+      message,
+      response.status,
+      payload && typeof payload.code === "string" ? payload.code : undefined,
+    );
   }
   return payload as T;
 }

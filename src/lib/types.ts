@@ -37,6 +37,8 @@ export interface TranscriptResult {
   transcript: string;
   blocks: TranscriptBlock[];
   reason?: string | null;
+  code?: string | null;
+  format?: "json3" | "vtt" | "srt" | null;
 }
 
 export interface BatchItem {

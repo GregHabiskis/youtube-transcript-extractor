@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from yt_dlp import YoutubeDL
+from yt_dlp.networking import Request
 from yt_dlp.utils import DownloadError, ExtractorError
 
 from backend.transcripts.cleaner import clean_cues, merge_paragraphs
@@ -55,6 +56,8 @@ class TranscriptOutput:
         transcript: str,
         status: str = "complete",
         reason: str | None = None,
+        code: str | None = None,
+        format: str | None = None,
     ) -> None:
         self.video = video
         self.source = source
@@ -63,6 +66,8 @@ class TranscriptOutput:
         self.transcript = transcript
         self.status = status
         self.reason = reason
+        self.code = code
+        self.format = format
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -80,6 +85,8 @@ class TranscriptOutput:
                 for block in self.blocks
             ],
             "reason": self.reason,
+            "code": self.code,
+            "format": self.format,
         }
 
 
@@ -117,16 +124,7 @@ class YouTubeService:
         if latest_videos < 1:
             raise YouTubeDiscoveryError("The number of latest videos must be a positive number.")
 
-        options = self._base_options()
-        options.update(
-            {
-                "extract_flat": True,
-                "lazy_playlist": True,
-                "playlist_items": f"1:{latest_videos}",
-                "noplaylist": False,
-                "ignoreerrors": True,
-            }
-        )
+        options = self._discovery_options(latest_videos)
         try:
             with YoutubeDL(options) as ydl:
                 result = ydl.extract_info(normalized.url, download=False)
@@ -192,33 +190,60 @@ class YouTubeService:
         language = validate_language(language)
 
         try:
-            info = self._extract_info(
-                normalized.url,
-                {
-                    "noplaylist": True,
-                    "writesubtitles": True,
-                    "writeautomaticsub": True,
-                    "subtitlesformat": "json3/vtt/srt",
-                    "ignore_no_formats_error": True,
-                },
-            )
+            info = self._extract_info(normalized.url, self._transcript_options())
         except YouTubeServiceError:
             raise
         except Exception as exc:
             logger.exception("Transcript extraction failed for %s", normalized.url)
             raise TranscriptExtractionError(
-                _public_yt_error(exc, "Could not extract this video."), cause=exc
+                _public_yt_error(exc, "Could not extract this video."),
+                cause=exc,
+                code="YOUTUBE_EXTRACTION_FAILED",
             ) from exc
 
         if not _has_real_title(info):
-            raise TranscriptExtractionError("This YouTube video is unavailable or restricted.")
+            raise TranscriptExtractionError(
+                "This YouTube video is unavailable or restricted.",
+                code="YOUTUBE_EXTRACTION_FAILED",
+            )
         video = self._video_from_info(info, fallback_url=normalized.url, index=1)
         if video is None:
-            raise TranscriptExtractionError("YouTube returned incomplete video information.")
+            raise TranscriptExtractionError(
+                "YouTube returned incomplete video information.",
+                code="YOUTUBE_EXTRACTION_FAILED",
+            )
+        manual_languages = _language_keys(info.get("subtitles"))
+        automatic_languages = _language_keys(info.get("automatic_captions"))
+        logger.debug(
+            "yt_dlp_stage=caption_discovery video_id=%s manual_languages=%s "
+            "automatic_language_count=%d automatic_sample=%s",
+            video.id,
+            manual_languages,
+            len(automatic_languages),
+            automatic_languages[:20],
+        )
         source, selected_language, track = _select_track(
             info.get("subtitles"), info.get("automatic_captions"), language
         )
+        logger.debug(
+            "yt_dlp_stage=caption_selection video_id=%s source=%s language=%s format=%s "
+            "inline_data=%s",
+            video.id,
+            source,
+            selected_language,
+            track.get("ext") if track else None,
+            bool(track and track.get("data") is not None),
+        )
         if not source or not selected_language or not track:
+            code = _caption_unavailable_code(
+                info.get("subtitles"), info.get("automatic_captions"), language
+            )
+            logger.debug(
+                "yt_dlp_stage=caption_unavailable video_id=%s code=%s requested_language=%s",
+                video.id,
+                code,
+                language,
+            )
             return TranscriptOutput(
                 video=video,
                 source=None,
@@ -231,20 +256,38 @@ class YouTubeService:
                     if language != "auto"
                     else "No captions are available for this video."
                 ),
+                code=code,
             )
 
-        cues = self._download_and_parse_track(track, info)
-        cleaned = clean_cues(cues)
-        blocks = merge_paragraphs(cleaned)
+        try:
+            cues = self._download_and_parse_track(track, info)
+            cleaned = clean_cues(cues)
+            blocks = merge_paragraphs(cleaned)
+        except TranscriptExtractionError:
+            raise
+        except Exception as exc:
+            logger.exception("Transcript post-processing failed video_id=%s", video.id)
+            raise TranscriptExtractionError(
+                "The caption text could not be processed.", cause=exc, code="INTERNAL_ERROR"
+            ) from exc
+        logger.debug(
+            "yt_dlp_stage=transcript_processed video_id=%s raw_cues=%d cleaned_cues=%d blocks=%d",
+            video.id,
+            len(cues),
+            len(cleaned),
+            len(blocks),
+        )
         if not blocks:
             return TranscriptOutput(
                 video=video,
-                source=None,
-                language=None,
+                source=source,
+                language=selected_language,
                 blocks=[],
                 transcript="",
                 status="no_captions",
                 reason="The caption track contained no spoken text.",
+                code="NO_CAPTIONS",
+                format=str(track.get("ext", "")).lower() or None,
             )
 
         transcript = render_plaintext(
@@ -262,6 +305,7 @@ class YouTubeService:
             language=selected_language,
             blocks=blocks,
             transcript=transcript,
+            format=str(track.get("ext", "")).lower() or None,
         )
 
     def _extract_info(
@@ -270,10 +314,29 @@ class YouTubeService:
         options = self._base_options()
         if extra_options:
             options.update(extra_options)
+        mode = (
+            "transcript"
+            if extra_options and extra_options.get("writesubtitles")
+            else "discovery"
+            if extra_options and extra_options.get("extract_flat")
+            else "metadata"
+        )
+        logger.debug(
+            "yt_dlp_stage=metadata_start mode=%s extract_flat=%s skip_download=%s",
+            mode,
+            bool(options.get("extract_flat")),
+            bool(options.get("skip_download")),
+        )
         with YoutubeDL(options) as ydl:
             result = ydl.extract_info(url, download=False)
         if not isinstance(result, Mapping):
             raise YouTubeServiceError("yt-dlp returned no video information.")
+        logger.debug(
+            "yt_dlp_stage=metadata_ok mode=%s video_id=%s title_present=%s",
+            mode,
+            result.get("id"),
+            bool(_string_value(result.get("title"))),
+        )
         return result
 
     @staticmethod
@@ -289,6 +352,34 @@ class YouTubeService:
             "check_formats": False,
             "logger": _YtDlpLogger(),
         }
+
+    @staticmethod
+    def _discovery_options(latest_videos: int) -> dict[str, Any]:
+        options = YouTubeService._base_options()
+        options.update(
+            {
+                "extract_flat": True,
+                "lazy_playlist": True,
+                "playlist_items": f"1:{latest_videos}",
+                "noplaylist": False,
+                "ignoreerrors": True,
+            }
+        )
+        return options
+
+    @staticmethod
+    def _transcript_options() -> dict[str, Any]:
+        options = YouTubeService._base_options()
+        options.update(
+            {
+                "noplaylist": True,
+                "writesubtitles": True,
+                "writeautomaticsub": True,
+                "subtitlesformat": "json3/vtt/srt",
+                "ignore_no_formats_error": True,
+            }
+        )
+        return options
 
     @staticmethod
     def _video_from_info(
@@ -332,44 +423,118 @@ class YouTubeService:
 
     @staticmethod
     def _download_and_parse_track(track: Mapping[str, Any], info: Mapping[str, Any]) -> list:
+        extension = str(track.get("ext", "")).lower()
         raw_data = track.get("data")
         if raw_data is None:
             url = track.get("url")
             if not isinstance(url, str) or not url.startswith(("https://", "http://")):
-                raise TranscriptExtractionError("yt-dlp returned an invalid subtitle URL.")
+                raise TranscriptExtractionError(
+                    "yt-dlp returned an invalid subtitle URL.", code="SUBTITLE_ACCESS_FAILED"
+                )
             if not _is_allowed_caption_url(url):
-                raise TranscriptExtractionError("yt-dlp returned a caption URL outside YouTube.")
+                raise TranscriptExtractionError(
+                    "yt-dlp returned a caption URL outside YouTube.",
+                    code="SUBTITLE_ACCESS_FAILED",
+                )
             options = YouTubeService._base_options()
-            options["http_headers"] = info.get("http_headers") or {}
+            headers: dict[str, str] = {}
+            for header_group in (info.get("http_headers"), track.get("http_headers")):
+                if isinstance(header_group, Mapping):
+                    headers.update(
+                        {
+                            str(name): str(value)
+                            for name, value in header_group.items()
+                            if value is not None
+                        }
+                    )
             try:
                 with YoutubeDL(options) as ydl:
-                    response = ydl.urlopen(url)
-                    raw_bytes = response.read(MAX_SUBTITLE_BYTES + 1)
+                    response = ydl.urlopen(Request(url, headers=headers))
+                    try:
+                        raw_bytes = response.read(MAX_SUBTITLE_BYTES + 1)
+                    finally:
+                        with suppress(Exception):
+                            response.close()
             except Exception as exc:
-                logger.exception("Subtitle download failed")
+                logger.error(
+                    "yt_dlp_stage=subtitle_download_failed video_id=%s format=%s "
+                    "exception_type=%s message=%s",
+                    info.get("id"),
+                    extension,
+                    type(exc).__name__,
+                    _safe_error_message(exc),
+                )
                 raise TranscriptExtractionError(
                     _public_yt_error(exc, "YouTube did not return the selected captions."),
                     cause=exc,
+                    code="SUBTITLE_DOWNLOAD_FAILED",
                 ) from exc
+            if isinstance(raw_bytes, str):
+                raw_bytes = raw_bytes.encode("utf-8")
+            if not isinstance(raw_bytes, bytes):
+                raise TranscriptExtractionError(
+                    "YouTube returned an invalid subtitle response.",
+                    code="SUBTITLE_DOWNLOAD_FAILED",
+                )
             if len(raw_bytes) > MAX_SUBTITLE_BYTES:
                 raise TranscriptExtractionError(
-                    "The subtitle response was too large to process safely."
+                    "The subtitle response was too large to process safely.",
+                    code="SUBTITLE_DOWNLOAD_FAILED",
                 )
             raw_data = raw_bytes.decode("utf-8-sig", errors="replace")
-        if not isinstance(raw_data, str):
+        elif isinstance(raw_data, bytes):
+            raw_data = raw_data.decode("utf-8-sig", errors="replace")
+        elif not isinstance(raw_data, str):
             raw_data = str(raw_data)
 
-        extension = str(track.get("ext", "")).lower()
+        raw_size = len(raw_data.encode("utf-8"))
+        if raw_size > MAX_SUBTITLE_BYTES:
+            raise TranscriptExtractionError(
+                "The subtitle response was too large to process safely.",
+                code="SUBTITLE_DOWNLOAD_FAILED",
+            )
+        logger.debug(
+            "yt_dlp_stage=subtitle_retrieved video_id=%s format=%s bytes=%d retrieval=%s",
+            info.get("id"),
+            extension,
+            raw_size,
+            "inline" if track.get("data") is not None else "url",
+        )
         try:
             if extension == "json3":
-                return parse_json3(raw_data)
-            if extension in {"vtt", "srt"}:
-                return parse_vtt(raw_data)
+                cues = parse_json3(raw_data)
+            elif extension in {"vtt", "srt"}:
+                cues = parse_vtt(raw_data)
+            else:
+                raise TranscriptExtractionError(
+                    "The selected caption format is not supported.",
+                    code="SUBTITLE_PARSE_FAILED",
+                )
         except SubtitleParseError as exc:
+            logger.error(
+                "yt_dlp_stage=subtitle_parse_failed video_id=%s format=%s "
+                "exception_type=%s message=%s",
+                info.get("id"),
+                extension,
+                type(exc).__name__,
+                _safe_error_message(exc),
+            )
             raise TranscriptExtractionError(
-                "The selected captions had an unsupported structure.", cause=exc
+                "The selected captions had an unsupported structure.",
+                cause=exc,
+                code="SUBTITLE_PARSE_FAILED",
             ) from exc
-        raise TranscriptExtractionError("The selected caption format is not supported.")
+        if not cues and raw_data.strip():
+            raise TranscriptExtractionError(
+                "The selected captions had no parseable cues.", code="SUBTITLE_PARSE_FAILED"
+            )
+        logger.debug(
+            "yt_dlp_stage=subtitle_parsed video_id=%s format=%s cues=%d",
+            info.get("id"),
+            extension,
+            len(cues),
+        )
+        return cues
 
 
 def validate_language(value: str) -> str:
@@ -414,6 +579,27 @@ def _select_track(
     return None, None, None
 
 
+def _language_keys(value: Any) -> list[str]:
+    if not isinstance(value, Mapping):
+        return []
+    return sorted(str(language) for language in value)
+
+
+def _caption_unavailable_code(manual: Any, automatic: Any, requested_language: str) -> str:
+    manual_map = manual if isinstance(manual, Mapping) else {}
+    automatic_map = automatic if isinstance(automatic, Mapping) else {}
+    if not manual_map and not automatic_map:
+        return "NO_CAPTIONS"
+    if requested_language == "auto":
+        return "SUBTITLE_ACCESS_FAILED"
+    requested = requested_language.casefold().replace("_", "-")
+    for language_map in (manual_map, automatic_map):
+        for language, _formats in language_map.items():
+            if _language_score(language, requested) < 100:
+                return "SUBTITLE_ACCESS_FAILED"
+    return "LANGUAGE_UNAVAILABLE"
+
+
 def _language_score(language: Any, requested: str) -> int:
     value = str(language).casefold().replace("_", "-")
     if value.endswith("-orig"):
@@ -451,8 +637,18 @@ def _is_normal_video_entry(info: Mapping[str, Any], url: str) -> bool:
 
 
 def _is_allowed_caption_url(url: str) -> bool:
-    host = (urlsplit(url).hostname or "").lower().rstrip(".")
-    return host == "youtube.com" or host.endswith(".youtube.com")
+    try:
+        host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    return (
+        host == "youtube.com"
+        or host.endswith(".youtube.com")
+        or host == "youtube-nocookie.com"
+        or host.endswith(".youtube-nocookie.com")
+        or host == "googlevideo.com"
+        or host.endswith(".googlevideo.com")
+    )
 
 
 def _string_value(value: Any) -> str | None:
@@ -499,3 +695,12 @@ def _public_yt_error(error: Exception, fallback: str) -> str:
     if isinstance(error, (ExtractorError, DownloadError)):
         return fallback
     return fallback
+
+
+def _safe_error_message(error: Exception) -> str:
+    """Keep diagnostic messages useful without logging signed caption URLs."""
+
+    message = str(error)
+    if "?" in message:
+        message = message.split("?", 1)[0] + "?…"
+    return message[:500]
