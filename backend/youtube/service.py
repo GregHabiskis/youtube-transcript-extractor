@@ -214,6 +214,22 @@ class YouTubeService:
             )
         manual_languages = _language_keys(info.get("subtitles"))
         automatic_languages = _language_keys(info.get("automatic_captions"))
+        if not manual_languages and not automatic_languages:
+            fallback_info = self._extract_caption_client_fallback(normalized.url)
+            if fallback_info is not None:
+                fallback_manual_languages = _language_keys(fallback_info.get("subtitles"))
+                fallback_automatic_languages = _language_keys(
+                    fallback_info.get("automatic_captions")
+                )
+                if fallback_manual_languages or fallback_automatic_languages:
+                    fallback_video = self._video_from_info(
+                        fallback_info, fallback_url=normalized.url, index=1
+                    )
+                    if fallback_video is not None:
+                        info = fallback_info
+                        video = fallback_video
+                        manual_languages = fallback_manual_languages
+                        automatic_languages = fallback_automatic_languages
         logger.debug(
             "yt_dlp_stage=caption_discovery video_id=%s manual_languages=%s "
             "automatic_language_count=%d automatic_sample=%s",
@@ -307,6 +323,27 @@ class YouTubeService:
             transcript=transcript,
             format=str(track.get("ext", "")).lower() or None,
         )
+
+    def _extract_caption_client_fallback(self, url: str) -> Mapping[str, Any] | None:
+        options = self._transcript_options()
+        options["extractor_args"] = {"youtube": {"player_client": ["android_vr"]}}
+        logger.debug("yt_dlp_stage=caption_client_fallback_start client=android_vr")
+        try:
+            info = self._extract_info(url, options)
+        except Exception as exc:
+            logger.warning(
+                "yt_dlp_stage=caption_client_fallback_failed client=android_vr "
+                "exception_type=%s message=%s",
+                type(exc).__name__,
+                _safe_error_message(exc),
+            )
+            return None
+        logger.debug(
+            "yt_dlp_stage=caption_client_fallback_ok client=android_vr manual=%d automatic=%d",
+            len(_language_keys(info.get("subtitles"))),
+            len(_language_keys(info.get("automatic_captions"))),
+        )
+        return info
 
     def _extract_info(
         self, url: str, extra_options: Mapping[str, Any] | None = None

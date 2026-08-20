@@ -170,6 +170,49 @@ def test_service_falls_back_to_automatic_captions(monkeypatch):
     assert "automatic words" in result.transcript
 
 
+def test_service_retries_caption_client_when_default_has_no_tracks(monkeypatch):
+    class CaptionClientFallbackYoutubeDL(FakeYoutubeDL):
+        def extract_info(self, url, download=False):
+            self.info_calls.append((url, download))
+            info = {
+                "id": "BaW_jenozKc",
+                "title": "Caption client fallback",
+                "channel": "Example Channel",
+            }
+            if self.options.get("extractor_args"):
+                info["subtitles"] = {
+                    "en": [
+                        {
+                            "ext": "json3",
+                            "data": json.dumps(
+                                {
+                                    "events": [
+                                        {
+                                            "tStartMs": 0,
+                                            "dDurationMs": 1000,
+                                            "segs": [{"utf8": "fallback captions"}],
+                                        }
+                                    ]
+                                }
+                            ),
+                        }
+                    ]
+                }
+            return info
+
+    FakeYoutubeDL.instances.clear()
+    monkeypatch.setattr("backend.youtube.service.YoutubeDL", CaptionClientFallbackYoutubeDL)
+    result = YouTubeService().extract_transcript("https://youtu.be/BaW_jenozKc", "en")
+
+    assert result.status == "complete"
+    assert "fallback captions" in result.transcript
+    assert len(CaptionClientFallbackYoutubeDL.instances) == 2
+    assert "extractor_args" not in CaptionClientFallbackYoutubeDL.instances[0].options
+    assert CaptionClientFallbackYoutubeDL.instances[1].options["extractor_args"] == {
+        "youtube": {"player_client": ["android_vr"]}
+    }
+
+
 def test_service_matches_english_variant_and_preserves_manual_priority(monkeypatch):
     class VariantYoutubeDL(FakeYoutubeDL):
         def extract_info(self, url, download=False):
