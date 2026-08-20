@@ -371,24 +371,55 @@ class YouTubeService:
             requested_language,
         )
         try:
-            response = requests.post(
-                "https://www.youtube.com/youtubei/v1/player",
-                headers={"Accept-Language": "en-US", "Content-Type": "application/json"},
-                json={
-                    "context": {
-                        "client": {"clientName": "ANDROID", "clientVersion": "20.10.38"}
-                    },
-                    "videoId": video.id,
+            request_data = {
+                "context": {
+                    "client": {"clientName": "ANDROID", "clientVersion": "20.10.38"}
                 },
-                timeout=20,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            tracks = (
-                payload.get("captions", {})
-                .get("playerCaptionsTracklistRenderer", {})
-                .get("captionTracks", [])
-            )
+                "videoId": video.id,
+            }
+            request_headers = {
+                "Accept-Language": "en-US",
+                "Content-Type": "application/json",
+            }
+            tracks: Any = []
+            last_error: Exception | None = None
+            for api_host in ("https://youtubei.googleapis.com", "https://www.youtube.com"):
+                try:
+                    response = requests.post(
+                        f"{api_host}/youtubei/v1/player",
+                        headers=request_headers,
+                        json=request_data,
+                        timeout=20,
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                    tracks = (
+                        payload.get("captions", {})
+                        .get("playerCaptionsTracklistRenderer", {})
+                        .get("captionTracks", [])
+                    )
+                    if isinstance(tracks, Sequence) and not isinstance(tracks, (str, bytes)):
+                        if tracks:
+                            logger.debug(
+                                "yt_dlp_stage=innertube_fallback_tracks host=%s count=%d",
+                                api_host,
+                                len(tracks),
+                            )
+                            break
+                    else:
+                        tracks = []
+                except Exception as exc:
+                    last_error = exc
+                    logger.debug(
+                        "yt_dlp_stage=innertube_fallback_host_failed host=%s "
+                        "exception_type=%s message=%s",
+                        api_host,
+                        type(exc).__name__,
+                        _safe_error_message(exc),
+                    )
+            else:
+                if last_error is not None:
+                    raise last_error
             if not isinstance(tracks, Sequence) or isinstance(tracks, (str, bytes)):
                 return None
             selected = _select_innertube_track(tracks, requested_language)

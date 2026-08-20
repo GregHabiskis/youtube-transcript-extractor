@@ -402,7 +402,7 @@ def test_service_uses_innertube_when_caption_clients_have_no_tracks(monkeypatch)
     ).encode()
 
     def fake_post(url, **_kwargs):
-        assert url == "https://www.youtube.com/youtubei/v1/player"
+        assert url.endswith("/youtubei/v1/player")
         return FakeResponse(
             payload={
                 "captions": {
